@@ -1,0 +1,4471 @@
+========== ./middleware.js ==========
+
+      import { NextResponse } from 'next/server';
+
+      export function middleware(request) {
+        // Example: Always redirect root path to the first page
+        if (request.nextUrl.pathname === '/') {
+          return NextResponse.redirect(new URL('/Home', request.url));
+        }
+        return NextResponse.next();
+      }
+    
+
+========== ./jsconfig.json ==========
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@components/*": [
+        "components/*"
+      ],
+      "@app/*": [
+        "app/*"
+      ]
+    }
+  }
+}
+
+========== ./contracts/TimestampRegistry.sol ==========
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+/// @title Enhanced Timestamp Registry Contract
+/// @author Blockchain Document Registry
+/// @notice A contract for registering document hashes with timestamps for verification
+/// @dev Provides document registration, verification, and ownership management functionality
+contract TimestampRegistry is AccessControl, Pausable, ReentrancyGuard {
+    // Roles
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant DOCUMENT_MANAGER_ROLE = keccak256("DOCUMENT_MANAGER_ROLE");
+    
+    /// @notice Enhanced structure to store document information
+    struct Document {
+        uint256 timestamp;     // Document registration timestamp
+        address owner;         // Address of document owner
+        bool exists;           // Whether document exists
+        string metadata;       // Additional document metadata
+        bool revoked;          // Whether document has been revoked
+        uint256 expiryDate;    // Optional expiration date (0 = no expiry)
+        string documentType;   // Type of document (PDF, DOC, etc.)
+    }
+    
+    /// @notice Structure for batch processing results
+    struct BatchResult {
+        uint256 successCount;
+        uint256 duplicateCount;
+        uint256 invalidCount;
+    }
+    
+    /// @notice Structure for detailed verification result
+    struct VerificationResult {
+        bool exists;
+        uint256 timestamp;
+        address owner;
+        bool revoked;
+        bool expired;
+        string documentType;
+    }
+    
+    /// @notice Mapping from document hash to Document struct
+    mapping(bytes32 => Document) private documents;
+    
+    /// @notice Mapping from owner address to their document hashes
+    mapping(address => bytes32[]) private documentsByOwner;
+    
+    // Events
+    /// @notice Emitted when a document is registered
+    event DocumentRegistered(bytes32 indexed documentHash, address indexed owner, uint256 timestamp, string documentType);
+    
+    /// @notice Emitted when document metadata is updated
+    event MetadataUpdated(bytes32 indexed documentHash, address indexed owner, string metadata);
+    
+    /// @notice Emitted when multiple documents are registered in batch
+    event BatchDocumentsRegistered(
+        address indexed owner, 
+        uint256 successCount, 
+        uint256 duplicateCount, 
+        uint256 invalidCount, 
+        uint256 timestamp
+    );
+    
+    /// @notice Emitted when a document is revoked
+    event DocumentRevoked(bytes32 indexed documentHash, address indexed revoker, string reason, uint256 timestamp);
+    
+    /// @notice Emitted when document expiry is set
+    event DocumentExpirySet(bytes32 indexed documentHash, address indexed owner, uint256 expiryDate);
+    
+    /// @notice Emitted when document ownership is transferred
+    event DocumentOwnershipTransferred(bytes32 indexed documentHash, address indexed previousOwner, address indexed newOwner);
+    
+    // Custom errors
+    /// @notice When document hash is already registered
+    error DocumentAlreadyExists(bytes32 documentHash);
+    
+    /// @notice When document does not exist in registry
+    error DocumentDoesNotExist(bytes32 documentHash);
+    
+    /// @notice When document hash is invalid or empty
+    error InvalidDocumentHash(bytes32 documentHash);
+    
+    /// @notice When caller is not the document owner
+    error NotDocumentOwner(address caller, address owner);
+    
+    /// @notice When document is already revoked
+    error DocumentAlreadyRevoked(bytes32 documentHash);
+    
+    /// @notice When provided address is invalid
+    error InvalidAddress(address addr);
+    
+    /// @notice When batch size exceeds limit
+    error BatchSizeTooLarge(uint256 size);
+    
+    /// @notice When expiry date is invalid
+    error InvalidExpiryDate(uint256 expiryDate);
+    
+    /// @notice Modifier to ensure caller is document owner
+    modifier onlyDocumentOwner(bytes32 documentHash) {
+        if (!documents[documentHash].exists) revert DocumentDoesNotExist(documentHash);
+        if (documents[documentHash].owner != msg.sender) revert NotDocumentOwner(msg.sender, documents[documentHash].owner);
+        _;
+    }
+    
+    /// @notice Contract constructor
+    constructor() {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(DOCUMENT_MANAGER_ROLE, msg.sender);
+    }
+    
+    /// @notice Registers a document hash with current timestamp
+    /// @param documentHash Hash of the document to register
+    /// @param documentType Type of document (e.g., "PDF", "DOC")
+    /// @return True if document was successfully registered
+    function registerDocument(
+        bytes32 documentHash, 
+        string calldata documentType
+    ) public whenNotPaused returns (bool) {
+        // Input validation
+        if (documentHash == bytes32(0)) revert InvalidDocumentHash(documentHash);
+        if (documents[documentHash].exists) revert DocumentAlreadyExists(documentHash);
+        
+        // Store document hash with timestamp
+        documents[documentHash] = Document({
+            timestamp: block.timestamp,
+            owner: msg.sender,
+            exists: true,
+            metadata: "",
+            revoked: false,
+            expiryDate: 0,
+            documentType: documentType
+        });
+        
+        // Update user's document list
+        documentsByOwner[msg.sender].push(documentHash);
+        
+        emit DocumentRegistered(documentHash, msg.sender, block.timestamp, documentType);
+        return true;
+    }
+    
+    /// @notice Verifies if a document hash exists in the registry
+    /// @param documentHash Hash of the document to verify
+    /// @return Whether the document exists and is valid (not revoked/expired)
+    function verifyDocument(bytes32 documentHash) public view returns (bool) {
+        // Input validation
+        if (documentHash == bytes32(0)) revert InvalidDocumentHash(documentHash);
+        
+        Document storage doc = documents[documentHash];
+        
+        // Check if document exists and is not revoked/expired
+        if (!doc.exists) {
+            return false;
+        }
+        
+        if (doc.revoked) {
+            return false;
+        }
+        
+        if (doc.expiryDate != 0 && block.timestamp > doc.expiryDate) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    /// @notice Provides detailed verification information for a document
+    /// @param documentHash Hash of the document to verify
+    /// @return Detailed verification result
+    function verifyDocumentDetailed(bytes32 documentHash) 
+        public 
+        view 
+        returns (VerificationResult memory) {
+        
+        if (documentHash == bytes32(0)) revert InvalidDocumentHash(documentHash);
+        
+        VerificationResult memory result;
+        Document storage doc = documents[documentHash];
+        
+        result.exists = doc.exists;
+        
+        if (result.exists) {
+            result.timestamp = doc.timestamp;
+            result.owner = doc.owner;
+            result.revoked = doc.revoked;
+            result.documentType = doc.documentType;
+            
+            if (doc.expiryDate != 0) {
+                result.expired = block.timestamp > doc.expiryDate;
+            }
+        }
+        
+        return result;
+    }
+    
+    /// @notice Retrieves the timestamp of a registered document
+    /// @param documentHash Hash of the document
+    /// @return Timestamp when document was registered
+    function getDocumentTimestamp(bytes32 documentHash) public view returns (uint256) {
+        // Input validation
+        if (documentHash == bytes32(0)) revert InvalidDocumentHash(documentHash);
+        if (!documents[documentHash].exists) revert DocumentDoesNotExist(documentHash);
+        
+        return documents[documentHash].timestamp;
+    }
+    
+    /// @notice Retrieves the owner of a registered document
+    /// @param documentHash Hash of the document
+    /// @return Address of document owner
+    function getDocumentOwner(bytes32 documentHash) public view returns (address) {
+        // Input validation
+        if (documentHash == bytes32(0)) revert InvalidDocumentHash(documentHash);
+        if (!documents[documentHash].exists) revert DocumentDoesNotExist(documentHash);
+        
+        return documents[documentHash].owner;
+    }
+    
+    /// @notice Updates metadata for a registered document
+    /// @param documentHash Hash of the document
+    /// @param _metadata New metadata for the document
+    /// @return True if metadata was successfully updated
+    function updateDocumentMetadata(bytes32 documentHash, string calldata _metadata) 
+        public 
+        whenNotPaused 
+        onlyDocumentOwner(documentHash) 
+        returns (bool) {
+        
+        documents[documentHash].metadata = _metadata;
+        
+        emit MetadataUpdated(documentHash, msg.sender, _metadata);
+        return true;
+    }
+    
+    /// @notice Revokes a document
+    /// @param documentHash Hash of the document to revoke
+    /// @param reason Reason for revocation
+    /// @return True if document was successfully revoked
+    function revokeDocument(bytes32 documentHash, string calldata reason) 
+        public 
+        whenNotPaused 
+        onlyDocumentOwner(documentHash) 
+        returns (bool) {
+        
+        if (documents[documentHash].revoked) revert DocumentAlreadyRevoked(documentHash);
+        
+        documents[documentHash].revoked = true;
+        
+        emit DocumentRevoked(documentHash, msg.sender, reason, block.timestamp);
+        return true;
+    }
+    
+    /// @notice Admin function to revoke a document
+    /// @param documentHash Hash of the document to revoke
+    /// @param reason Reason for revocation
+    /// @return True if document was successfully revoked
+    function revokeDocumentByAdmin(bytes32 documentHash, string calldata reason) 
+        public 
+        whenNotPaused 
+        onlyRole(DOCUMENT_MANAGER_ROLE) 
+        returns (bool) {
+        
+        if (!documents[documentHash].exists) revert DocumentDoesNotExist(documentHash);
+        if (documents[documentHash].revoked) revert DocumentAlreadyRevoked(documentHash);
+        
+        documents[documentHash].revoked = true;
+        
+        emit DocumentRevoked(documentHash, msg.sender, reason, block.timestamp);
+        return true;
+    }
+    
+    /// @notice Sets an expiry date for a document
+    /// @param documentHash Hash of the document
+    /// @param expiryDate Timestamp when document should expire
+    /// @return True if expiry was successfully set
+    function setDocumentExpiry(bytes32 documentHash, uint256 expiryDate) 
+        public 
+        whenNotPaused 
+        onlyDocumentOwner(documentHash) 
+        returns (bool) {
+        
+        if (expiryDate != 0 && expiryDate <= block.timestamp) revert InvalidExpiryDate(expiryDate);
+        
+        documents[documentHash].expiryDate = expiryDate;
+        
+        emit DocumentExpirySet(documentHash, msg.sender, expiryDate);
+        return true;
+    }
+    
+    /// @notice Transfers ownership of a document to another address
+    /// @param documentHash Hash of the document
+    /// @param newOwner Address of the new owner
+    /// @return True if transfer was successful
+    function transferDocumentOwnership(bytes32 documentHash, address newOwner) 
+        public 
+        whenNotPaused 
+        onlyDocumentOwner(documentHash) 
+        returns (bool) {
+        
+        if (newOwner == address(0)) revert InvalidAddress(address(0));
+        
+        // Remove document from current owner's list
+        bytes32[] storage ownerDocs = documentsByOwner[msg.sender];
+        for (uint256 i = 0; i < ownerDocs.length; i++) {
+            if (ownerDocs[i] == documentHash) {
+                // Swap with last element and pop for gas efficiency
+                ownerDocs[i] = ownerDocs[ownerDocs.length - 1];
+                ownerDocs.pop();
+                break;
+            }
+        }
+        
+        // Add document to new owner's list
+        documentsByOwner[newOwner].push(documentHash);
+        
+        // Update document owner
+        address previousOwner = documents[documentHash].owner;
+        documents[documentHash].owner = newOwner;
+        
+        emit DocumentOwnershipTransferred(documentHash, previousOwner, newOwner);
+        return true;
+    }
+    
+    /// @notice Registers multiple document hashes in a single transaction
+    /// @param documentHashes Array of document hashes to register
+    /// @param documentTypes Array of document types corresponding to each hash
+    /// @return Batch processing results
+    function batchRegisterDocuments(
+        bytes32[] calldata documentHashes,
+        string[] calldata documentTypes
+    ) 
+        public 
+        whenNotPaused 
+        nonReentrant 
+        returns (BatchResult memory) {
+        
+        if (documentHashes.length == 0) revert InvalidDocumentHash(bytes32(0));
+        if (documentHashes.length > 100) revert BatchSizeTooLarge(documentHashes.length);
+        if (documentHashes.length != documentTypes.length) revert InvalidDocumentHash(bytes32(0));
+        
+        BatchResult memory result;
+        
+        // Loop through document hashes array
+        for (uint256 i = 0; i < documentHashes.length; i++) {
+            bytes32 documentHash = documentHashes[i];
+            
+            // Check valid hash
+            if (documentHash == bytes32(0)) {
+                result.invalidCount++;
+                continue;
+            }
+            
+            // Check for duplicates
+            if (documents[documentHash].exists) {
+                result.duplicateCount++;
+                continue;
+            }
+            
+            // Store valid document
+            documents[documentHash] = Document({
+                timestamp: block.timestamp,
+                owner: msg.sender,
+                exists: true,
+                metadata: "",
+                revoked: false,
+                expiryDate: 0,
+                documentType: documentTypes[i]
+            });
+            
+            // Update user's document list
+            documentsByOwner[msg.sender].push(documentHash);
+            
+            // Increment success counter
+            result.successCount++;
+            
+            emit DocumentRegistered(documentHash, msg.sender, block.timestamp, documentTypes[i]);
+        }
+        
+        emit BatchDocumentsRegistered(
+            msg.sender, 
+            result.successCount, 
+            result.duplicateCount, 
+            result.invalidCount, 
+            block.timestamp
+        );
+        
+        return result;
+    }
+    
+    /// @notice Retrieves all document hashes registered by a user
+    /// @param userAddress Address of the user
+    /// @return Array of document hashes registered by user
+    function getUserDocuments(address userAddress) public view returns (bytes32[] memory) {
+        // Input validation
+        if (userAddress == address(0)) revert InvalidAddress(address(0));
+        
+        return documentsByOwner[userAddress];
+    }
+    
+    /// @notice Batch verify multiple documents
+    /// @param documentHashes Array of document hashes to verify
+    /// @return Array of verification results
+    function batchVerifyDocuments(bytes32[] calldata documentHashes) 
+        public 
+        view 
+        returns (bool[] memory) {
+        
+        bool[] memory results = new bool[](documentHashes.length);
+        
+        for (uint256 i = 0; i < documentHashes.length; i++) {
+            results[i] = verifyDocument(documentHashes[i]);
+        }
+        
+        return results;
+    }
+    
+    /// @notice Pauses the contract
+    function pause() public onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+    
+    /// @notice Unpauses the contract
+    function unpause() public onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+    
+    /// @notice Validates if a document hash meets SHA-256 format requirements
+    /// @param documentHash Hash to validate
+    /// @return True if hash is valid SHA-256 format
+    function validateDocumentHash(bytes32 documentHash) public pure returns (bool) {
+        if (documentHash == bytes32(0)) revert InvalidDocumentHash(documentHash);
+        return true;
+    }
+}
+
+========== ./contracts/ABIs/NFT.json ==========
+[
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "_timestampRegistryAddress",
+                "type": "address"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "constructor"
+    },
+    {
+        "inputs": [],
+        "name": "AccessControlBadConfirmation",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            },
+            {
+                "internalType": "bytes32",
+                "name": "neededRole",
+                "type": "bytes32"
+            }
+        ],
+        "name": "AccessControlUnauthorizedAccount",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "sender",
+                "type": "address"
+            },
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            },
+            {
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            }
+        ],
+        "name": "ERC721IncorrectOwner",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "operator",
+                "type": "address"
+            },
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "ERC721InsufficientApproval",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "approver",
+                "type": "address"
+            }
+        ],
+        "name": "ERC721InvalidApprover",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "operator",
+                "type": "address"
+            }
+        ],
+        "name": "ERC721InvalidOperator",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            }
+        ],
+        "name": "ERC721InvalidOwner",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "receiver",
+                "type": "address"
+            }
+        ],
+        "name": "ERC721InvalidReceiver",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "sender",
+                "type": "address"
+            }
+        ],
+        "name": "ERC721InvalidSender",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "ERC721NonexistentToken",
+        "type": "error"
+    },
+    {
+        "inputs": [],
+        "name": "EnforcedPause",
+        "type": "error"
+    },
+    {
+        "inputs": [],
+        "name": "ExpectedPause",
+        "type": "error"
+    },
+    {
+        "inputs": [],
+        "name": "ReentrancyGuardReentrantCall",
+        "type": "error"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "approved",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "Approval",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "operator",
+                "type": "address"
+            },
+            {
+                "indexed": false,
+                "internalType": "bool",
+                "name": "approved",
+                "type": "bool"
+            }
+        ],
+        "name": "ApprovalForAll",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "_fromTokenId",
+                "type": "uint256"
+            },
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "_toTokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "BatchMetadataUpdate",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "CertificateBurned",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "recipient",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            },
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "CertificateMinted",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "revoker",
+                "type": "address"
+            },
+            {
+                "indexed": false,
+                "internalType": "string",
+                "name": "reason",
+                "type": "string"
+            }
+        ],
+        "name": "CertificateRevoked",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "from",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "to",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "CertificateTransferred",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "_tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "MetadataUpdate",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "Paused",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "oldRegistry",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "newRegistry",
+                "type": "address"
+            }
+        ],
+        "name": "RegistryUpdated",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "previousAdminRole",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "newAdminRole",
+                "type": "bytes32"
+            }
+        ],
+        "name": "RoleAdminChanged",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "sender",
+                "type": "address"
+            }
+        ],
+        "name": "RoleGranted",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "sender",
+                "type": "address"
+            }
+        ],
+        "name": "RoleRevoked",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "from",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "to",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "Transfer",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "Unpaused",
+        "type": "event"
+    },
+    {
+        "inputs": [],
+        "name": "CERTIFICATE_MANAGER_ROLE",
+        "outputs": [
+            {
+                "internalType": "bytes32",
+                "name": "",
+                "type": "bytes32"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "DEFAULT_ADMIN_ROLE",
+        "outputs": [
+            {
+                "internalType": "bytes32",
+                "name": "",
+                "type": "bytes32"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "PAUSER_ROLE",
+        "outputs": [
+            {
+                "internalType": "bytes32",
+                "name": "",
+                "type": "bytes32"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "REGISTRY_MANAGER_ROLE",
+        "outputs": [
+            {
+                "internalType": "bytes32",
+                "name": "",
+                "type": "bytes32"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "to",
+                "type": "address"
+            },
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "approve",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            }
+        ],
+        "name": "balanceOf",
+        "outputs": [
+            {
+                "internalType": "uint256",
+                "name": "",
+                "type": "uint256"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "burnCertificate",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "getApproved",
+        "outputs": [
+            {
+                "internalType": "address",
+                "name": "",
+                "type": "address"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "getCertificateByDocumentHash",
+        "outputs": [
+            {
+                "internalType": "uint256",
+                "name": "",
+                "type": "uint256"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "getCertificateDetails",
+        "outputs": [
+            {
+                "components": [
+                    {
+                        "internalType": "bytes32",
+                        "name": "documentHash",
+                        "type": "bytes32"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "timestamp",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "address",
+                        "name": "submitter",
+                        "type": "address"
+                    },
+                    {
+                        "internalType": "string",
+                        "name": "documentType",
+                        "type": "string"
+                    },
+                    {
+                        "internalType": "string",
+                        "name": "documentName",
+                        "type": "string"
+                    }
+                ],
+                "internalType": "struct ProofOfExistenceNFT.DocumentMetadata",
+                "name": "",
+                "type": "tuple"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getCurrentTokenId",
+        "outputs": [
+            {
+                "internalType": "uint256",
+                "name": "",
+                "type": "uint256"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            }
+        ],
+        "name": "getRoleAdmin",
+        "outputs": [
+            {
+                "internalType": "bytes32",
+                "name": "",
+                "type": "bytes32"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            }
+        ],
+        "name": "getTokensByOwner",
+        "outputs": [
+            {
+                "internalType": "uint256[]",
+                "name": "",
+                "type": "uint256[]"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "grantRole",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "hasRole",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            },
+            {
+                "internalType": "address",
+                "name": "operator",
+                "type": "address"
+            }
+        ],
+        "name": "isApprovedForAll",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "isCertificateRevoked",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "string",
+                "name": "documentType",
+                "type": "string"
+            },
+            {
+                "internalType": "string",
+                "name": "documentName",
+                "type": "string"
+            }
+        ],
+        "name": "mintCertificate",
+        "outputs": [
+            {
+                "internalType": "uint256",
+                "name": "",
+                "type": "uint256"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "name",
+        "outputs": [
+            {
+                "internalType": "string",
+                "name": "",
+                "type": "string"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "ownerOf",
+        "outputs": [
+            {
+                "internalType": "address",
+                "name": "",
+                "type": "address"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "pause",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "paused",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "address",
+                "name": "callerConfirmation",
+                "type": "address"
+            }
+        ],
+        "name": "renounceRole",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            },
+            {
+                "internalType": "string",
+                "name": "reason",
+                "type": "string"
+            }
+        ],
+        "name": "revokeCertificate",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "revokeRole",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "from",
+                "type": "address"
+            },
+            {
+                "internalType": "address",
+                "name": "to",
+                "type": "address"
+            },
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "safeTransferFrom",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "from",
+                "type": "address"
+            },
+            {
+                "internalType": "address",
+                "name": "to",
+                "type": "address"
+            },
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            },
+            {
+                "internalType": "bytes",
+                "name": "data",
+                "type": "bytes"
+            }
+        ],
+        "name": "safeTransferFrom",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "operator",
+                "type": "address"
+            },
+            {
+                "internalType": "bool",
+                "name": "approved",
+                "type": "bool"
+            }
+        ],
+        "name": "setApprovalForAll",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "_newRegistryAddress",
+                "type": "address"
+            }
+        ],
+        "name": "setTimestampRegistry",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes4",
+                "name": "interfaceId",
+                "type": "bytes4"
+            }
+        ],
+        "name": "supportsInterface",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "symbol",
+        "outputs": [
+            {
+                "internalType": "string",
+                "name": "",
+                "type": "string"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "tokenURI",
+        "outputs": [
+            {
+                "internalType": "string",
+                "name": "",
+                "type": "string"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            },
+            {
+                "internalType": "address",
+                "name": "to",
+                "type": "address"
+            }
+        ],
+        "name": "transferCertificate",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "from",
+                "type": "address"
+            },
+            {
+                "internalType": "address",
+                "name": "to",
+                "type": "address"
+            },
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "transferFrom",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "unpause",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "uint256",
+                "name": "tokenId",
+                "type": "uint256"
+            }
+        ],
+        "name": "verifyDocumentCertificate",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32[]",
+                "name": "documentHashes",
+                "type": "bytes32[]"
+            }
+        ],
+        "name": "verifyMultipleDocuments",
+        "outputs": [
+            {
+                "internalType": "bool[]",
+                "name": "",
+                "type": "bool[]"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+
+========== ./contracts/ABIs/registry.json ==========
+[
+    {
+        "inputs": [],
+        "stateMutability": "nonpayable",
+        "type": "constructor"
+    },
+    {
+        "inputs": [],
+        "name": "AccessControlBadConfirmation",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            },
+            {
+                "internalType": "bytes32",
+                "name": "neededRole",
+                "type": "bytes32"
+            }
+        ],
+        "name": "AccessControlUnauthorizedAccount",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "size",
+                "type": "uint256"
+            }
+        ],
+        "name": "BatchSizeTooLarge",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "DocumentAlreadyExists",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "DocumentAlreadyRevoked",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "DocumentDoesNotExist",
+        "type": "error"
+    },
+    {
+        "inputs": [],
+        "name": "EnforcedPause",
+        "type": "error"
+    },
+    {
+        "inputs": [],
+        "name": "ExpectedPause",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "addr",
+                "type": "address"
+            }
+        ],
+        "name": "InvalidAddress",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "InvalidDocumentHash",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "expiryDate",
+                "type": "uint256"
+            }
+        ],
+        "name": "InvalidExpiryDate",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "caller",
+                "type": "address"
+            },
+            {
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            }
+        ],
+        "name": "NotDocumentOwner",
+        "type": "error"
+    },
+    {
+        "inputs": [],
+        "name": "ReentrancyGuardReentrantCall",
+        "type": "error"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            },
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "successCount",
+                "type": "uint256"
+            },
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "duplicateCount",
+                "type": "uint256"
+            },
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "invalidCount",
+                "type": "uint256"
+            },
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "timestamp",
+                "type": "uint256"
+            }
+        ],
+        "name": "BatchDocumentsRegistered",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            },
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "expiryDate",
+                "type": "uint256"
+            }
+        ],
+        "name": "DocumentExpirySet",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "previousOwner",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "newOwner",
+                "type": "address"
+            }
+        ],
+        "name": "DocumentOwnershipTransferred",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            },
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "timestamp",
+                "type": "uint256"
+            },
+            {
+                "indexed": false,
+                "internalType": "string",
+                "name": "documentType",
+                "type": "string"
+            }
+        ],
+        "name": "DocumentRegistered",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "revoker",
+                "type": "address"
+            },
+            {
+                "indexed": false,
+                "internalType": "string",
+                "name": "reason",
+                "type": "string"
+            },
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "timestamp",
+                "type": "uint256"
+            }
+        ],
+        "name": "DocumentRevoked",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "owner",
+                "type": "address"
+            },
+            {
+                "indexed": false,
+                "internalType": "string",
+                "name": "metadata",
+                "type": "string"
+            }
+        ],
+        "name": "MetadataUpdated",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "Paused",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "previousAdminRole",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "newAdminRole",
+                "type": "bytes32"
+            }
+        ],
+        "name": "RoleAdminChanged",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "sender",
+                "type": "address"
+            }
+        ],
+        "name": "RoleGranted",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "sender",
+                "type": "address"
+            }
+        ],
+        "name": "RoleRevoked",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "Unpaused",
+        "type": "event"
+    },
+    {
+        "inputs": [],
+        "name": "ADMIN_ROLE",
+        "outputs": [
+            {
+                "internalType": "bytes32",
+                "name": "",
+                "type": "bytes32"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "DEFAULT_ADMIN_ROLE",
+        "outputs": [
+            {
+                "internalType": "bytes32",
+                "name": "",
+                "type": "bytes32"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "DOCUMENT_MANAGER_ROLE",
+        "outputs": [
+            {
+                "internalType": "bytes32",
+                "name": "",
+                "type": "bytes32"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "PAUSER_ROLE",
+        "outputs": [
+            {
+                "internalType": "bytes32",
+                "name": "",
+                "type": "bytes32"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32[]",
+                "name": "documentHashes",
+                "type": "bytes32[]"
+            },
+            {
+                "internalType": "string[]",
+                "name": "documentTypes",
+                "type": "string[]"
+            }
+        ],
+        "name": "batchRegisterDocuments",
+        "outputs": [
+            {
+                "components": [
+                    {
+                        "internalType": "uint256",
+                        "name": "successCount",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "duplicateCount",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "invalidCount",
+                        "type": "uint256"
+                    }
+                ],
+                "internalType": "struct TimestampRegistry.BatchResult",
+                "name": "",
+                "type": "tuple"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32[]",
+                "name": "documentHashes",
+                "type": "bytes32[]"
+            }
+        ],
+        "name": "batchVerifyDocuments",
+        "outputs": [
+            {
+                "internalType": "bool[]",
+                "name": "",
+                "type": "bool[]"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "getDocumentOwner",
+        "outputs": [
+            {
+                "internalType": "address",
+                "name": "",
+                "type": "address"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "getDocumentTimestamp",
+        "outputs": [
+            {
+                "internalType": "uint256",
+                "name": "",
+                "type": "uint256"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            }
+        ],
+        "name": "getRoleAdmin",
+        "outputs": [
+            {
+                "internalType": "bytes32",
+                "name": "",
+                "type": "bytes32"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "userAddress",
+                "type": "address"
+            }
+        ],
+        "name": "getUserDocuments",
+        "outputs": [
+            {
+                "internalType": "bytes32[]",
+                "name": "",
+                "type": "bytes32[]"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "grantRole",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "hasRole",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "pause",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "paused",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "string",
+                "name": "documentType",
+                "type": "string"
+            }
+        ],
+        "name": "registerDocument",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "address",
+                "name": "callerConfirmation",
+                "type": "address"
+            }
+        ],
+        "name": "renounceRole",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "string",
+                "name": "reason",
+                "type": "string"
+            }
+        ],
+        "name": "revokeDocument",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "string",
+                "name": "reason",
+                "type": "string"
+            }
+        ],
+        "name": "revokeDocumentByAdmin",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "role",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "revokeRole",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "uint256",
+                "name": "expiryDate",
+                "type": "uint256"
+            }
+        ],
+        "name": "setDocumentExpiry",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes4",
+                "name": "interfaceId",
+                "type": "bytes4"
+            }
+        ],
+        "name": "supportsInterface",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "address",
+                "name": "newOwner",
+                "type": "address"
+            }
+        ],
+        "name": "transferDocumentOwnership",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "unpause",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            },
+            {
+                "internalType": "string",
+                "name": "_metadata",
+                "type": "string"
+            }
+        ],
+        "name": "updateDocumentMetadata",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "validateDocumentHash",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "pure",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "verifyDocument",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bytes32",
+                "name": "documentHash",
+                "type": "bytes32"
+            }
+        ],
+        "name": "verifyDocumentDetailed",
+        "outputs": [
+            {
+                "components": [
+                    {
+                        "internalType": "bool",
+                        "name": "exists",
+                        "type": "bool"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "timestamp",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "address",
+                        "name": "owner",
+                        "type": "address"
+                    },
+                    {
+                        "internalType": "bool",
+                        "name": "revoked",
+                        "type": "bool"
+                    },
+                    {
+                        "internalType": "bool",
+                        "name": "expired",
+                        "type": "bool"
+                    },
+                    {
+                        "internalType": "string",
+                        "name": "documentType",
+                        "type": "string"
+                    }
+                ],
+                "internalType": "struct TimestampRegistry.VerificationResult",
+                "name": "",
+                "type": "tuple"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+
+========== ./contracts/ProofOfExistenceNFT.sol ==========
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
+
+/**
+ * @title Proof of Existence NFT Certificate
+ * @author Blockchain Proof of Existence Team
+ * @notice NFT-based certificate system for proving document existence at a specific time
+ * @dev Interacts with a timestamp registry to verify documents before minting certificates
+ */
+
+interface ITimestampRegistry {
+    function verifyDocument(bytes32 documentHash) external view returns (bool);
+}
+
+contract ProofOfExistenceNFT is ERC721URIStorage, Pausable, AccessControl, ReentrancyGuard {
+    using Strings for uint256;
+
+    // Role definitions
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant REGISTRY_MANAGER_ROLE = keccak256("REGISTRY_MANAGER_ROLE");
+    bytes32 public constant CERTIFICATE_MANAGER_ROLE = keccak256("CERTIFICATE_MANAGER_ROLE");
+
+    // Base URI for token metadata
+    string private constant baseURI = "https://proof-of-existence.example/token/";
+    
+    // Interface to the timestamp registry contract
+    ITimestampRegistry private timestampRegistry;
+    
+    // Simple counter for token IDs (starts at 1)
+    uint256 private _nextTokenId = 1;
+    
+    // Mapping from token ID to document metadata
+    mapping(uint256 => DocumentMetadata) private documentMetadata;
+    
+    // Mapping from document hash to token ID
+    mapping(bytes32 => uint256) private _certificateByDocumentHash;
+    
+    // Mapping to track revoked certificates
+    mapping(uint256 => bool) private _revokedCertificates;
+    
+    // Mapping of owner addresses to their token IDs
+    mapping(address => uint256[]) private _ownerTokens;
+    
+    struct DocumentMetadata {
+        bytes32 documentHash;
+        uint256 timestamp;
+        address submitter;
+        string documentType;     // PDF, DOC, etc.
+        string documentName;     // User-friendly name
+    }
+    
+    // Events
+    event CertificateMinted(address indexed recipient, uint256 indexed tokenId, bytes32 indexed documentHash);
+    event CertificateTransferred(address indexed from, address indexed to, uint256 indexed tokenId);
+    event CertificateBurned(address indexed owner, uint256 indexed tokenId);
+    event CertificateRevoked(uint256 indexed tokenId, address indexed revoker, string reason);
+    event RegistryUpdated(address indexed oldRegistry, address indexed newRegistry);
+    
+    /**
+     * @notice Contract constructor
+     * @param _timestampRegistryAddress Address of the timestamp registry contract
+     */
+    constructor(address _timestampRegistryAddress) ERC721("Document Proof Certificates", "DPC") {
+        require(_timestampRegistryAddress != address(0), "Invalid registry address");
+        timestampRegistry = ITimestampRegistry(_timestampRegistryAddress);
+        
+        // Setup roles
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(REGISTRY_MANAGER_ROLE, msg.sender);
+        _grantRole(CERTIFICATE_MANAGER_ROLE, msg.sender);
+    }
+    
+    /**
+     * @notice Helper function to check if a token exists
+     * @param tokenId ID of the token to check
+     * @return True if the token exists
+     */
+    function _tokenExists(uint256 tokenId) internal view returns (bool) {
+        try this.ownerOf(tokenId) returns (address) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    
+    /**
+     * @notice Mint a new certificate for a timestamped document
+     * @param documentHash Hash of the document to certify
+     * @param documentType Type of document (e.g., "PDF", "DOC")
+     * @param documentName User-friendly name for the document
+     * @return Unique identifier for the certificate
+     */
+    function mintCertificate(
+        bytes32 documentHash, 
+        string calldata documentType, 
+        string calldata documentName
+    ) external nonReentrant whenNotPaused returns (uint256) {
+        require(documentHash != bytes32(0), "Document hash cannot be empty");
+        require(timestampRegistry.verifyDocument(documentHash), "Document must be timestamped in registry");
+        require(_certificateByDocumentHash[documentHash] == 0, "Certificate already exists for this document");
+        
+        // Get token ID and increment counter
+        uint256 tokenId = _nextTokenId;
+        _nextTokenId++;
+        
+        // Create metadata
+        DocumentMetadata memory metadata = DocumentMetadata(
+            documentHash, 
+            block.timestamp, 
+            msg.sender,
+            documentType,
+            documentName
+        );
+        
+        // Mint token and store metadata
+        _safeMint(msg.sender, tokenId);
+        documentMetadata[tokenId] = metadata;
+        _certificateByDocumentHash[documentHash] = tokenId;
+        _ownerTokens[msg.sender].push(tokenId);
+        
+        emit CertificateMinted(msg.sender, tokenId, documentHash);
+        
+        return tokenId;
+    }
+    
+    /**
+     * @notice Transfer certificate ownership to another address
+     * @param tokenId ID of the certificate to transfer
+     * @param to Address to receive the certificate
+     * @return True if transfer was successful
+     */
+    function transferCertificate(uint256 tokenId, address to) external nonReentrant whenNotPaused returns (bool) {
+        require(tokenId > 0, "Token ID must be valid");
+        require(ownerOf(tokenId) == msg.sender, "Must be certificate owner");
+        require(to != address(0), "Invalid recipient address");
+        require(!_revokedCertificates[tokenId], "Cannot transfer revoked certificate");
+        
+        // Remove from sender's tokens
+        uint256[] storage senderTokens = _ownerTokens[msg.sender];
+        for (uint256 i = 0; i < senderTokens.length; i++) {
+            if (senderTokens[i] == tokenId) {
+                senderTokens[i] = senderTokens[senderTokens.length - 1];
+                senderTokens.pop();
+                break;
+            }
+        }
+        
+        // Add to recipient's tokens
+        _ownerTokens[to].push(tokenId);
+        
+        _safeTransfer(msg.sender, to, tokenId, "");
+        
+        emit CertificateTransferred(msg.sender, to, tokenId);
+        
+        return true;
+    }
+    
+    /**
+     * @notice Burn a certificate
+     * @param tokenId ID of the certificate to burn
+     * @return True if burn was successful
+     */
+    function burnCertificate(uint256 tokenId) external nonReentrant whenNotPaused returns (bool) {
+        require(tokenId > 0, "Token ID must be valid");
+        require(_tokenExists(tokenId), "Certificate does not exist");
+        require(ownerOf(tokenId) == msg.sender || isApprovedForAll(ownerOf(tokenId), msg.sender), 
+                "Must be certificate owner or approved");
+        
+        address owner = ownerOf(tokenId);
+        bytes32 documentHash = documentMetadata[tokenId].documentHash;
+        
+        // Remove from owner's tokens
+        uint256[] storage ownerTokens = _ownerTokens[owner];
+        for (uint256 i = 0; i < ownerTokens.length; i++) {
+            if (ownerTokens[i] == tokenId) {
+                ownerTokens[i] = ownerTokens[ownerTokens.length - 1];
+                ownerTokens.pop();
+                break;
+            }
+        }
+        
+        // Clear hash mapping
+        _certificateByDocumentHash[documentHash] = 0;
+        
+        // Burn the token
+        _burn(tokenId);
+        delete documentMetadata[tokenId];
+        delete _revokedCertificates[tokenId];
+        
+        emit CertificateBurned(owner, tokenId);
+        
+        return true;
+    }
+    
+    /**
+     * @notice Revoke a certificate
+     * @param tokenId ID of the certificate to revoke
+     * @param reason Reason for revocation
+     */
+    function revokeCertificate(uint256 tokenId, string calldata reason) 
+        external 
+        onlyRole(CERTIFICATE_MANAGER_ROLE) 
+        whenNotPaused {
+        require(_tokenExists(tokenId), "Certificate does not exist");
+        require(!_revokedCertificates[tokenId], "Certificate already revoked");
+        
+        _revokedCertificates[tokenId] = true;
+        emit CertificateRevoked(tokenId, msg.sender, reason);
+    }
+    
+    /**
+     * @notice Check if a certificate is revoked
+     * @param tokenId ID of the certificate
+     * @return Whether the certificate is revoked
+     */
+    function isCertificateRevoked(uint256 tokenId) external view returns (bool) {
+        require(_tokenExists(tokenId), "Certificate does not exist");
+        return _revokedCertificates[tokenId];
+    }
+    
+    /**
+     * @notice Get details about a certificate
+     * @param tokenId ID of the certificate
+     * @return Metadata about the document certificate
+     */
+    function getCertificateDetails(uint256 tokenId) external view returns (DocumentMetadata memory) {
+        require(tokenId > 0, "Token ID must be valid");
+        require(_tokenExists(tokenId), "Certificate must exist");
+        
+        return documentMetadata[tokenId];
+    }
+    
+    /**
+     * @notice Get certificate ID by document hash
+     * @param documentHash Hash of the document
+     * @return ID of the certificate for this document
+     */
+    function getCertificateByDocumentHash(bytes32 documentHash) external view returns (uint256) {
+        uint256 tokenId = _certificateByDocumentHash[documentHash];
+        require(tokenId != 0, "No certificate exists for this document");
+        return tokenId;
+    }
+    
+    /**
+     * @notice Get all certificates owned by an address
+     * @param owner Address to check
+     * @return Array of token IDs owned by the address
+     */
+    function getTokensByOwner(address owner) external view returns (uint256[] memory) {
+        return _ownerTokens[owner];
+    }
+    
+    /**
+     * @notice Verify if a document matches a certificate
+     * @param documentHash Hash of the document to verify
+     * @param tokenId ID of the certificate to check against
+     * @return True if document hash matches certificate and not revoked
+     */
+    function verifyDocumentCertificate(bytes32 documentHash, uint256 tokenId) external view returns (bool) {
+        require(documentHash != bytes32(0), "Document hash cannot be empty");
+        require(tokenId > 0, "Token ID must be valid");
+        
+        if (!_tokenExists(tokenId) || _revokedCertificates[tokenId]) {
+            return false;
+        }
+        
+        DocumentMetadata memory metadata = documentMetadata[tokenId];
+        return metadata.documentHash == documentHash;
+    }
+    
+    /**
+     * @notice Verify multiple documents at once
+     * @param documentHashes Array of document hashes to verify
+     * @return Array of booleans indicating if each document is verified
+     */
+    function verifyMultipleDocuments(bytes32[] calldata documentHashes) external view returns (bool[] memory) {
+        bool[] memory results = new bool[](documentHashes.length);
+        
+        for (uint256 i = 0; i < documentHashes.length; i++) {
+            results[i] = timestampRegistry.verifyDocument(documentHashes[i]);
+        }
+        
+        return results;
+    }
+    
+    /**
+     * @notice Pause the contract
+     */
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @notice Unpause the contract
+     */
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+    
+    /**
+     * @notice Update the timestamp registry address
+     * @param _newRegistryAddress Address of the new registry contract
+     */
+    function setTimestampRegistry(address _newRegistryAddress) external onlyRole(REGISTRY_MANAGER_ROLE) whenNotPaused {
+        require(_newRegistryAddress != address(0), "Registry address cannot be zero");
+        
+        address oldRegistry = address(timestampRegistry);
+        timestampRegistry = ITimestampRegistry(_newRegistryAddress);
+        
+        emit RegistryUpdated(oldRegistry, _newRegistryAddress);
+    }
+    
+    /**
+     * @notice Get the current token ID counter value
+     * @return Current token ID counter value
+     */
+    function getCurrentTokenId() external view returns (uint256) {
+        return _nextTokenId - 1;
+    }
+    
+    /**
+     * @notice Check if contract supports an interface
+     * @param interfaceId Interface identifier
+     * @return True if interface is supported
+     */
+    function supportsInterface(bytes4 interfaceId) public view override(ERC721URIStorage, AccessControl) returns (bool) {
+        return super.supportsInterface(interfaceId);
+    }
+    
+    /**
+     * @notice Get the URI for a token
+     * @param tokenId ID of the token
+     * @return URI for token metadata
+     */
+    function tokenURI(uint256 tokenId) public view override(ERC721URIStorage) returns (string memory) {
+        require(_tokenExists(tokenId), "ERC721URIStorage: URI query for nonexistent token");
+        return string(abi.encodePacked(baseURI, tokenId.toString()));
+    }
+}
+
+========== ./package.json ==========
+{
+  "name": "nextjs-builder",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@reduxjs/toolkit": "^1.9.5",
+    "autoprefixer": "^10.4.21",
+    "ethers": "5.7.1",
+    "next": "14.2.5",
+    "react": "^18",
+    "react-dom": "^18",
+    "react-redux": "^8.1.3",
+    "styled-components": "^6.1.12"
+  },
+  "devDependencies": {
+    "postcss": "^8",
+    "tailwindcss": "^3.4.1"
+  }
+}
+
+
+========== ./postcss.config.js ==========
+/** @type {import('postcss-load-config').Config} */
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+
+
+========== ./merge.sh ==========
+#!/bin/bash
+
+# Output file
+OUTPUT_FILE="merged_output.txt"
+
+# Start fresh
+> $OUTPUT_FILE
+
+# Find and process all files inside the api folder, excluding specified files/dirs
+echo "Merging all files from the api folder into $OUTPUT_FILE..."
+find ./ -type f \
+    -not -path "*/\.*" \
+    -not -name "package-lock.json" \
+    -not -path "*/.vercel/*" \
+    -not -path "*/app/favicon.ico" \
+    -not -path "*node_modules*" \
+    -not -path "*public*" \
+    -not -name "$OUTPUT_FILE" | while read -r file; do
+    # Add the file name as a separator
+    echo "========== $file ==========" >> $OUTPUT_FILE
+    # Append the file content
+    cat "$file" >> $OUTPUT_FILE
+    # Add a blank line for separation
+    echo -e "\n" >> $OUTPUT_FILE
+done
+
+echo "All files from the api folder have been merged into $OUTPUT_FILE!"
+
+========== ./redux/actions.js ==========
+
+          // Action Types
+          export const SET_SIGNER_CONNECTION = "SET_SIGNER_CONNECTION";
+          export const SET_SIGNER_INSTANCE = "SET_SIGNER_INSTANCE";
+          export const SET_SIGNER_CHAIN_ID = "SET_SIGNER_CHAIN_ID";
+
+          // Action Creators
+          export const setSignerConnection = (isConnected) => ({
+            type: SET_SIGNER_CONNECTION,
+            payload: isConnected
+          });
+
+          export const setSignerInstance = (signer) => ({
+            type: SET_SIGNER_INSTANCE,
+            payload: signer
+          });
+
+          export const setSignerChainId = (chainId) => ({
+            type: SET_SIGNER_CHAIN_ID,
+            payload: chainId
+          });
+
+          // Thunk Action Creator for connecting signer
+          export const connectSignerAction = (provider) => async (dispatch) => {
+            try {
+              const signer = provider.getSigner();
+              dispatch(setSignerInstance(signer));
+              dispatch(setSignerConnection(true));
+              
+              const network = await provider.getNetwork();
+              dispatch(setSignerChainId(network.chainId));
+            } catch (error) {
+              console.error('Error connecting signer:', error);
+            }
+          };
+
+          export const disconnectSignerAction = () => (dispatch) => {
+            dispatch(setSignerInstance(null));
+            dispatch(setSignerConnection(false));
+            dispatch(setSignerChainId(null));
+          };
+
+          export const updateSignerChainIdAction = (chainId) => (dispatch) => {
+            dispatch(setSignerChainId(chainId));
+          };
+
+          // Selectors
+          export const getIsSignerConnected = (state) => state.signer.isConnected;
+          export const getSignerInstance = (state) => state.signer.signer;
+          export const getSignerChainId = (state) => state.signer.chainId;
+
+          // Combined selector
+          export const getSignerState = (state) => ({
+            isConnected: getIsSignerConnected(state),
+            signer: getSignerInstance(state),
+            chainId: getSignerChainId(state)
+          });
+
+          const initialState = {
+            isConnected: false,
+            signer: null,
+            chainId: null
+          };
+
+          export const signerReducer = (state = initialState, action) => {
+            switch (action.type) {
+              case SET_SIGNER_CONNECTION:
+                return {
+                  ...state,
+                  isConnected: action.payload
+                };
+              case SET_SIGNER_INSTANCE:
+                return {
+                  ...state,
+                  signer: action.payload
+                };
+              case SET_SIGNER_CHAIN_ID:
+                return {
+                  ...state,
+                  chainId: action.payload
+                };
+              default:
+                return state;
+            }
+          };
+
+========== ./redux/reducers.js ==========
+
+          import { combineReducers } from 'redux';
+
+          // Wallet Reducer
+          const walletInitialState = {
+            isConnected: false,
+            address: '',
+            chainId: null
+          };
+
+          const walletReducer = (state = walletInitialState, action) => {
+            switch (action.type) {
+              case 'SET_WALLET_CONNECTION':
+                return {
+                  ...state,
+                  isConnected: action.payload
+                };
+              case 'SET_WALLET_ADDRESS':
+                return {
+                  ...state,
+                  address: action.payload
+                };
+              case 'SET_CHAIN_ID':
+                return {
+                  ...state,
+                  chainId: action.payload
+                };
+              default:
+                return state;
+            }
+          };
+
+          // Signer Reducer
+          const signerInitialState = {
+            isConnected: false,
+            signer: null,
+            chainId: null
+          };
+
+          const signerReducer = (state = signerInitialState, action) => {
+            switch (action.type) {
+              case 'SET_SIGNER_CONNECTION':
+                return {
+                  ...state,
+                  isConnected: action.payload
+                };
+              case 'SET_SIGNER_INSTANCE':
+                return {
+                  ...state,
+                  signer: action.payload
+                };
+              case 'SET_SIGNER_CHAIN_ID':
+                return {
+                  ...state,
+                  chainId: action.payload
+                };
+              default:
+                return state;
+            }
+          };
+
+          // Combine reducers
+          const rootReducer = combineReducers({
+            wallet: walletReducer,
+            signer: signerReducer
+          });
+
+          export default rootReducer;
+
+========== ./redux/store.js ==========
+
+          import { configureStore } from '@reduxjs/toolkit';
+          import rootReducer from './reducers';
+
+          const store = configureStore({
+            reducer: rootReducer,
+          });
+          export default store;
+        
+
+========== ./redux/selectors.js ==========
+export const getWalletState = state => state.wallet;
+          export const getSignerState = state => state.signer;
+
+          // Individual wallet selectors
+          export const getIsWalletConnected = state => state.wallet.isConnected;
+          export const getWalletAddress = state => state.wallet.address;
+          export const getWalletChainId = state => state.wallet.chainId;
+
+          // Individual signer selectors
+          export const getIsSignerConnected = state => state.signer.isConnected;
+          export const getSignerInstance = state => state.signer.signer;
+          export const getSignerChainId = state => state.signer.chainId;
+
+          // Combined selectors
+          export const getFullState = state => ({
+            wallet: getWalletState(state),
+            signer: getSignerState(state)
+          });
+
+========== ./tailwind.config.js ==========
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  // You can switch darkMode to 'media' or 'class' if you plan to support dark mode
+  darkMode: false,
+  content: [
+    "./app/**/*.{js,ts,jsx,tsx,mdx}",
+    "./components/**/*.{js,ts,jsx,tsx,mdx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        // Custom colors that mimic your styled-components palette
+        primary: "#FFC107",       // Amber
+        secondary: "#673AB7",     // Deep Purple
+        accent: "#8BC34A",        // Light Green
+        dark: "#333333",
+        light: "#f9f9f9",
+        background: "#fafafa",
+        border: "#e0e0e0",
+        text: "#555555",
+      },
+      backgroundImage: {
+        "gradient-radial": "radial-gradient(var(--tw-gradient-stops))",
+        "gradient-conic": "conic-gradient(from 180deg at 50% 50%, var(--tw-gradient-stops))",
+      },
+      fontFamily: {
+        // Use Inter as your primary sans-serif font
+        sans: ["Inter", "system-ui", "sans-serif"],
+      },
+      boxShadow: {
+        // Custom shadow utilities that might replace some of your styled shadow rules
+        soft: "0 4px 6px rgba(0, 0, 0, 0.1)",
+        hard: "0 2px 4px rgba(0, 0, 0, 0.1)",
+      },
+      keyframes: {
+        spin: {
+          "0%": { transform: "rotate(0deg)" },
+          "100%": { transform: "rotate(360deg)" },
+        },
+      },
+      animation: {
+        spin: "spin 1s linear infinite",
+      },
+      // You can add additional spacing, borderRadius, or other theme extensions as needed
+    },
+  },
+  plugins: [],
+};
+
+
+========== ./app/Home/page.js ==========
+import Header from '@components/Header';
+import HeroSection from '@components/HeroSection';
+import ServiceFeatures from '@components/ServiceFeatures';
+import HowItWorks from '@components/HowItWorks';
+import RegisterDocument from '@components/RegisterDocument';
+import ValidateDocument from '@components/ValidateDocument';
+import Footer from '@components/Footer';
+
+export default function Home() {
+  return (
+    <main>
+      <Header />
+      <HeroSection />
+      <ServiceFeatures />
+      <HowItWorks />
+      <RegisterDocument />
+      <ValidateDocument />
+      <Footer />
+    </main>
+  );
+}
+
+========== ./app/layout.js ==========
+
+'use client';
+
+import { Provider } from 'react-redux';
+import store from '../redux/store';
+import "./globals.css"
+
+export default function RootLayout({ children }) {
+
+  return (
+    <html lang="en">
+      <body>
+        <Provider store={store}>
+          {children}
+        </Provider>
+      </body>
+    </html>
+  );
+}
+
+
+========== ./app/globals.css ==========
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+========== ./next.config.js ==========
+
+        /** @type {import("next").NextConfig} */
+        const nextConfig = {
+            reactStrictMode: true, 
+            experimental: {
+                appDir: true,
+            },
+            compiler: {
+                styledComponents: true,
+            },
+        };
+        module.exports = nextConfig;
+      
+
+========== ./components/ValidateDocument.js ==========
+'use client';
+import React, { useState } from 'react';
+
+export default function ValidateDocument() {
+  const [documentHash, setDocumentHash] = useState('');
+  const [isValid, setIsValid] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [animateResult, setAnimateResult] = useState(false);
+
+  const validateDocument = async () => {
+    if (!documentHash.trim()) {
+      setError('Please enter a document hash');
+      return;
+    }
+
+    setIsLoading(true);
+    setError('');
+    setIsValid(null);
+
+    try {
+      // Simulating contract call
+      setTimeout(() => {
+        const result = Math.random() > 0.5;
+        setIsValid(result);
+        setAnimateResult(true);
+        setIsLoading(false);
+        setTimeout(() => setAnimateResult(false), 500);
+      }, 1500);
+    } catch (err) {
+      setError('Failed to validate document: ' + err.message);
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col min-h-screen bg-gradient-to-br from-[#f7f9fc] to-[#eef1f5] font-sans">
+      
+      {/* Main Content */}
+      <main className="flex-1 py-12 px-8 max-w-4xl mx-auto w-full md:px-6">
+        <div className="text-center mb-12">
+          <h2 className="text-4xl font-extrabold text-gray-800 mb-4">Verify Document Authenticity</h2>
+          <p className="text-lg text-gray-600 max-w-xl mx-auto">
+            Confirm if your document has been timestamped on the blockchain. Enter the document hash to verify its authenticity and view timestamp information.
+          </p>
+        </div>
+
+        <div className="bg-white rounded-xl shadow-lg p-8 md:p-10 w-full">
+          {/* Document Hash Input */}
+          <div className="mb-8">
+            <h3 className="text-xl font-bold text-gray-800 mb-3">Enter Document Hash</h3>
+            <p className="text-sm text-gray-600 mb-4">
+              Paste the SHA-256 hash of your document to verify if it has been timestamped on our blockchain.
+            </p>
+            <div className="flex flex-col md:flex-row gap-4">
+              <input
+                type="text"
+                placeholder="e.g. 8a1f9a8b0c3d..."
+                value={documentHash}
+                onChange={(e) => setDocumentHash(e.target.value)}
+                className="flex-1 px-4 py-3 border-2 border-gray-300 rounded-md font-mono transition focus:outline-none focus:border-purple-700 focus:shadow focus:shadow-purple-200"
+              />
+              <button
+                onClick={validateDocument}
+                disabled={isLoading}
+                className="flex items-center justify-center min-w-[150px] bg-amber-400 text-gray-800 font-semibold px-4 py-3 rounded-md transition duration-200 hover:bg-amber-500 hover:shadow disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isLoading ? "Verifying..." : "Verify Document"}
+              </button>
+            </div>
+            {error && (
+              <div className="mt-4 p-3 bg-red-50 border-l-4 border-red-500 text-red-600 rounded">
+                {error}
+              </div>
+            )}
+          </div>
+
+          {/* Validation Result */}
+          {isValid !== null && (
+            <div
+              className={`border-t border-gray-200 pt-8 transition duration-300 ${animateResult ? 'opacity-70 scale-95' : 'opacity-100 scale-100'}`}
+            >
+              <div className="flex items-center mb-6">
+                <div
+                  className={`w-12 h-12 rounded-full flex items-center justify-center mr-4 text-xl ${
+                    isValid ? 'bg-green-500' : 'bg-red-500'
+                  } text-white`}
+                >
+                  {isValid ? '✓' : '✗'}
+                </div>
+                <div className="flex-1 text-left">
+                  <h3 className={`text-xl font-bold mb-1 ${isValid ? 'text-green-700' : 'text-red-700'}`}>
+                    {isValid ? 'Document Verified' : 'Document Not Found'}
+                  </h3>
+                  <p className="text-sm text-gray-600">
+                    {isValid
+                      ? 'This document has been timestamped on the blockchain.'
+                      : 'This document has not been timestamped or the hash is incorrect.'}
+                  </p>
+                </div>
+              </div>
+              {isValid && (
+                <div className="bg-gray-50 rounded-md p-6">
+                  <h4 className="text-base font-semibold text-gray-800 mb-4">Timestamp Information</h4>
+                  <div className="grid grid-cols-2 gap-4 sm:grid-cols-1">
+                    <div className="flex flex-col">
+                      <span className="text-xs text-gray-500 mb-1">Timestamp Date</span>
+                      <span className="text-sm text-gray-800 font-medium">
+                        {new Date().toLocaleDateString('en-US', {
+                          year: 'numeric',
+                          month: 'long',
+                          day: 'numeric',
+                        })}
+                      </span>
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-xs text-gray-500 mb-1">Timestamp Time</span>
+                      <span className="text-sm text-gray-800 font-medium">
+                        {new Date().toLocaleTimeString('en-US')}
+                      </span>
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-xs text-gray-500 mb-1">Block Number</span>
+                      <span className="text-sm text-gray-800 font-medium">14,325,678</span>
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-xs text-gray-500 mb-1">Transaction Hash</span>
+                      <span className="text-sm text-gray-800 font-medium whitespace-nowrap overflow-hidden text-ellipsis">
+                        0x3a1f9a8b0c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f
+                      </span>
+                    </div>
+                  </div>
+                  {isValid && (
+                    <div className="mt-6 flex flex-col sm:flex-row gap-4">
+                      <button className="flex-1 bg-purple-700 text-white font-medium py-3 rounded-md transition hover:bg-purple-600">
+                        View on Explorer
+                      </button>
+                      <button className="flex-1 bg-gray-100 text-gray-800 font-medium py-3 rounded-md transition hover:bg-gray-200">
+                        Download Certificate
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+
+========== ./components/Header.js ==========
+'use client';
+import React, { useState } from 'react';
+import { useSelector, useDispatch } from 'react-redux';
+import {
+  connectSignerAction,
+  disconnectSignerAction,
+} from '../redux/actions';
+import { ethers } from 'ethers';
+
+export default function Header() {
+  const dispatch = useDispatch();
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+
+  // Example selectors from Redux
+  const isWalletConnected = useSelector((state) => state.wallet.isConnected);
+  const walletAddress = useSelector((state) => state.wallet.address);
+
+  const handleConnectWallet = async () => {
+    // Dispatch your connect wallet action
+    // For example:
+    // if (window.ethereum) {
+    //   const provider = new ethers.providers.Web3Provider(window.ethereum);
+    //   await provider.send('eth_requestAccounts', []);
+    //   dispatch(connectSignerAction(provider));
+    // }
+    dispatch(connectSignerAction(/* provider */));
+  };
+
+  const handleDisconnectWallet = () => {
+    // Dispatch your disconnect wallet action
+    dispatch(disconnectSignerAction());
+  };
+
+  return (
+    <header className="bg-white shadow-md sticky top-0 z-50">
+      {/* Outer container to center content */}
+      <div className="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
+        {/* Left: Brand/logo */}
+        <div className="flex items-center space-x-3">
+          <svg
+            className="w-10 h-10 text-amber-400"
+            viewBox="0 0 24 24"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z" />
+          </svg>
+          <span className="text-2xl font-bold text-gray-800">
+            TimestampDocs
+          </span>
+        </div>
+
+        {/* Middle: Desktop navigation (hidden on mobile) */}
+        {/* <nav className="hidden md:flex space-x-6">
+          {['Features', 'How It Works', 'Validate'].map((item) => (
+            <a
+              key={item}
+              href={`#${item.toLowerCase().replace(/\s+/g, '-')}`}
+              className="relative text-gray-600 font-medium hover:text-purple-700 transition-colors"
+            >
+              {item}
+            </a>
+          ))}
+        </nav> */}
+
+        {/* Right: Connect Wallet (hidden on mobile) */}
+        <div className="hidden md:flex items-center space-x-4">
+          {isWalletConnected ? (
+            <button
+              onClick={handleDisconnectWallet}
+              className="bg-transparent text-purple-700 border border-purple-700 px-4 py-2 rounded font-medium transition duration-200 hover:bg-purple-100"
+            >
+              Disconnect
+            </button>
+          ) : (
+            <button
+              onClick={handleConnectWallet}
+              className="bg-amber-400 text-gray-800 px-4 py-2 rounded font-medium shadow transition duration-200 hover:bg-amber-500"
+            >
+              Connect Wallet
+            </button>
+          )}
+        </div>
+
+        {/* Mobile Menu Toggle (shown on mobile) */}
+        {/* <button
+          onClick={() => setIsMenuOpen(!isMenuOpen)}
+          className="md:hidden bg-transparent border-0 cursor-pointer p-2 text-gray-800"
+        >
+          {isMenuOpen ? (
+            // Close icon
+            <svg
+              className="w-6 h-6"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+            >
+              <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 
+                6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+            </svg>
+          ) : (
+            // Hamburger icon
+            <svg
+              className="w-6 h-6"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+            >
+              <path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z" />
+            </svg>
+          )}
+        </button> */}
+      </div>
+
+      {/* Mobile Navigation (visible when toggled) */}
+      {isMenuOpen && (
+        <div className="md:hidden bg-white px-4 pb-4 shadow">
+          {/* <nav className="flex flex-col space-y-3 mb-4">
+            {['Home', 'Features', 'How It Works', 'Validate'].map((item) => (
+              <a
+                key={item}
+                href={item === 'Home' ? '/' : `/${item.toLowerCase().replace(/\s+/g, '-')}`}
+                className="text-gray-600 font-medium hover:text-purple-700 transition-colors"
+                onClick={() => setIsMenuOpen(false)}
+              >
+                {item}
+              </a>
+            ))}
+          </nav> */}
+          <div>
+            {isWalletConnected ? (
+              <button
+                onClick={() => {
+                  handleDisconnectWallet();
+                  setIsMenuOpen(false);
+                }}
+                className="w-full bg-transparent text-purple-700 border border-purple-700 px-4 py-2 rounded font-medium transition duration-200 hover:bg-purple-100"
+              >
+                Disconnect
+              </button>
+            ) : (
+              <button
+                onClick={() => {
+                  handleConnectWallet();
+                  setIsMenuOpen(false);
+                }}
+                className="w-full bg-amber-400 text-gray-800 px-4 py-2 rounded font-medium shadow transition duration-200 hover:bg-amber-500"
+              >
+                Connect Wallet
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </header>
+  );
+}
+
+
+========== ./components/ServiceFeatures.js ==========
+'use client';
+import React from 'react';
+
+export default function ServiceFeatures() {
+  return (
+    <section className="relative overflow-hidden bg-[#fafafa] py-20 px-8 md:py-12 md:px-6">
+      {/* Background Gradient Overlay */}
+      <div
+        className="absolute inset-0 z-0"
+        style={{
+          background:
+            "linear-gradient(135deg, rgba(255,193,7,0.05) 0%, rgba(103,58,183,0.05) 100%)",
+        }}
+      ></div>
+
+      <div className="relative z-10 max-w-6xl mx-auto">
+        {/* Header */}
+        <div className="text-center mb-16">
+          <h2 className="relative inline-block text-4xl md:text-5xl font-bold text-gray-800 mb-4">
+            Secure Document Timestamping
+            <span className="absolute bottom-[-12px] left-1/2 -translate-x-1/2 w-20 h-1 rounded bg-gradient-to-r from-amber-400 to-purple-700"></span>
+          </h2>
+          <p className="text-lg md:text-xl text-gray-600 max-w-3xl mx-auto leading-relaxed">
+            Our advanced platform provides tamper-proof verification with cutting-edge blockchain technology
+          </p>
+        </div>
+
+        {/* Feature Cards Grid */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
+          {/* Feature Card 1 */}
+          <div className="relative bg-white rounded-xl p-8 flex flex-col items-center text-center shadow-md transition-transform duration-300 hover:-translate-y-2 hover:shadow-xl overflow-hidden">
+            {/* Vertical Accent Bar */}
+            <div className="absolute top-0 left-0 h-[60%] w-1 bg-amber-400 rounded-tl-xl transform scale-y-0 origin-top transition-transform duration-300 hover:scale-y-100"></div>
+            <div className="w-20 h-20 rounded-full bg-[#FFF8E1] flex items-center justify-center mb-6 transition-colors duration-300 hover:bg-[#FFF0C4]">
+              <svg
+                className="w-10 h-10"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="#FFC107"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+              </svg>
+            </div>
+            <h3 className="text-2xl font-semibold text-gray-800 mb-4">Military-Grade Security</h3>
+            <p className="text-gray-600 leading-relaxed mb-6">
+              Your documents are protected with advanced encryption standards ensuring maximum security and privacy.
+            </p>
+            {/* <a
+              href="#"
+              className="inline-flex items-center text-purple-700 font-medium text-base transition-colors duration-200 hover:text-amber-400"
+            >
+              Learn more
+              <svg
+                className="ml-2 w-4 h-4 transition-transform duration-200 hover:translate-x-1"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <line x1="5" y1="12" x2="19" y2="12" />
+                <polyline points="12 5 19 12 12 19" />
+              </svg>
+            </a> */}
+          </div>
+
+          {/* Feature Card 2 */}
+          <div className="relative bg-white rounded-xl p-8 flex flex-col items-center text-center shadow-md transition-transform duration-300 hover:-translate-y-2 hover:shadow-xl overflow-hidden">
+            <div className="absolute top-0 left-0 h-[60%] w-1 bg-green-400 rounded-tl-xl transform scale-y-0 origin-top transition-transform duration-300 hover:scale-y-100"></div>
+            <div className="w-20 h-20 rounded-full bg-[#F1F8E9] flex items-center justify-center mb-6 transition-colors duration-300 hover:bg-[#E8F5E9]">
+              <svg
+                className="w-10 h-10"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="#8BC34A"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </div>
+            <h3 className="text-2xl font-semibold text-gray-800 mb-4">Blockchain Verification</h3>
+            <p className="text-gray-600 leading-relaxed mb-6">
+              Immutable timestamps backed by decentralized blockchain technology provide tamper-proof verification.
+            </p>
+            {/* <a
+              href="#"
+              className="inline-flex items-center text-purple-700 font-medium text-base transition-colors duration-200 hover:text-green-400"
+            >
+              Learn more
+              <svg
+                className="ml-2 w-4 h-4 transition-transform duration-200 hover:translate-x-1"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <line x1="5" y1="12" x2="19" y2="12" />
+                <polyline points="12 5 19 12 12 19" />
+              </svg>
+            </a> */}
+          </div>
+
+          {/* Feature Card 3 */}
+          <div className="relative bg-white rounded-xl p-8 flex flex-col items-center text-center shadow-md transition-transform duration-300 hover:-translate-y-2 hover:shadow-xl overflow-hidden">
+            <div className="absolute top-0 left-0 h-[60%] w-1 bg-purple-700 rounded-tl-xl transform scale-y-0 origin-top transition-transform duration-300 hover:scale-y-100"></div>
+            <div className="w-20 h-20 rounded-full bg-[#EDE7F6] flex items-center justify-center mb-6 transition-colors duration-300 hover:bg-[#E1D5F5]">
+              <svg
+                className="w-10 h-10"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="#673AB7"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" />
+                <polyline points="13 2 13 9 20 9" />
+              </svg>
+            </div>
+            <h3 className="text-2xl font-semibold text-gray-800 mb-4">Intuitive User Experience</h3>
+            <p className="text-gray-600 leading-relaxed mb-6">
+              Our user-friendly interface makes document timestamping accessible to everyone, no technical expertise required.
+            </p>
+            {/* <a
+              href="#"
+              className="inline-flex items-center text-purple-700 font-medium text-base transition-colors duration-200 hover:text-purple-700"
+            >
+              Learn more
+              <svg
+                className="ml-2 w-4 h-4 transition-transform duration-200 hover:translate-x-1"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <line x1="5" y1="12" x2="19" y2="12" />
+                <polyline points="12 5 19 12 12 19" />
+              </svg>
+            </a> */}
+          </div>
+        </div>
+
+        {/* Call-to-Action Button */}
+        {/* <div className="mt-16 text-center">
+          <button
+            className="relative inline-block min-w-[200px] rounded-full px-10 py-4 text-lg font-semibold text-gray-800 transition-transform duration-300 shadow-md hover:-translate-y-1 hover:shadow-lg active:translate-y-0 overflow-hidden"
+            style={{ background: "linear-gradient(45deg, #673AB7, #8BC34A)" }}
+          >
+            Get Started Now
+            <span className="absolute top-0 left-[-100%] w-full h-full bg-gradient-to-r from-transparent via-white/20 to-transparent transition-all duration-700 hover:left-full"></span>
+          </button>
+        </div> */}
+      </div>
+    </section>
+  );
+}
+
+
+========== ./components/RegisterDocument.js ==========
+'use client';
+import React, { useState } from 'react';
+
+export default function RegisterDocument() {
+  const [file, setFile] = useState(null);
+  const [documentName, setDocumentName] = useState('');
+  const [documentDescription, setDocumentDescription] = useState('');
+  const [documentHash, setDocumentHash] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isSuccess, setIsSuccess] = useState(false);
+  const [error, setError] = useState('');
+  const [uploadProgress, setUploadProgress] = useState(0);
+
+  const handleFileChange = (event) => {
+    const selectedFile = event.target.files[0];
+    if (selectedFile) {
+      setFile(selectedFile);
+      calculateHash(selectedFile);
+    }
+  };
+
+  const calculateHash = (file) => {
+    setUploadProgress(0);
+    const reader = new FileReader();
+
+    reader.onprogress = (event) => {
+      if (event.lengthComputable) {
+        const progress = Math.round((event.loaded / event.total) * 50);
+        setUploadProgress(progress);
+      }
+    };
+
+    reader.onload = async (event) => {
+      try {
+        setUploadProgress(50);
+        const buffer = event.target.result;
+        const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        const hashHex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+        setDocumentHash(hashHex);
+        setUploadProgress(100);
+      } catch (err) {
+        setError('Error calculating document hash');
+        setUploadProgress(0);
+      }
+    };
+
+    reader.onerror = () => {
+      setError('Error reading file');
+      setUploadProgress(0);
+    };
+
+    reader.readAsArrayBuffer(file);
+  };
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+
+    if (!documentHash || !documentName) {
+      setError('Please upload a document and provide a name');
+      return;
+    }
+
+    setIsSubmitting(true);
+    setError('');
+
+    try {
+      // Simulate blockchain interaction
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // In a real implementation, this would call the smart contract
+
+      setIsSuccess(true);
+      setDocumentName('');
+      setDocumentDescription('');
+      setFile(null);
+      setDocumentHash('');
+    } catch (err) {
+      setError('Failed to register document on blockchain');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col min-h-screen bg-[#fafafa] font-sans">
+
+      {/* Main Content */}
+      <main className="flex-1 p-8 max-w-6xl mx-auto w-full md:p-12">
+        <div className="bg-white rounded-lg shadow overflow-hidden">
+          <div className="bg-amber-400 px-8 py-6 border-b border-gray-200">
+            <h2 className="text-gray-800 text-xl font-semibold">Register New Document</h2>
+            <p className="text-gray-600 mt-1 text-base leading-relaxed">
+              Securely timestamp your document on the blockchain for immutable proof of existence.
+            </p>
+          </div>
+          <form className="p-8 md:p-10" onSubmit={handleSubmit}>
+            {/* File Upload */}
+            <div className="mb-8">
+              <label className="block font-semibold text-gray-800 mb-3 text-base">
+                Upload Document
+              </label>
+              <div
+                onClick={() => document.getElementById('file-upload').click()}
+                className={`cursor-pointer rounded border-2 border-dashed transition-colors p-8 text-center ${
+                  file ? "border-green-500 bg-[#f1f8e9]" : "border-gray-300 bg-[#fafafa]"
+                } hover:border-amber-400 hover:bg-amber-50`}
+              >
+                <input
+                  type="file"
+                  id="file-upload"
+                  className="hidden"
+                  onChange={handleFileChange}
+                  accept=".pdf,.doc,.docx,.txt,.jpg,.jpeg,.png"
+                />
+                {file ? (
+                  <div className="flex flex-col items-center">
+                    <div className="w-12 h-12 bg-green-500 rounded-full flex items-center justify-center mb-3 text-white font-bold">
+                      ✓
+                    </div>
+                    <span className="font-medium text-base text-gray-800 break-words">
+                      {file.name}
+                    </span>
+                    <span className="mt-2 text-sm text-gray-500">
+                      {(file.size / 1024 / 1024).toFixed(2)} MB
+                    </span>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center">
+                    <div className="w-16 h-16 bg-gray-200 rounded-full flex items-center justify-center mb-3 text-gray-500 text-2xl">
+                      +
+                    </div>
+                    <span className="font-medium text-base text-gray-800">
+                      Click to upload or drag and drop
+                    </span>
+                    <span className="mt-2 text-sm text-gray-500">
+                      PDF, DOC, TXT, JPG, PNG (Max 10MB)
+                    </span>
+                  </div>
+                )}
+                {uploadProgress > 0 && uploadProgress < 100 && (
+                  <div className="mt-4 w-full">
+                    <div className="w-full h-1 bg-gray-300 rounded overflow-hidden">
+                      <div
+                        style={{ width: `${uploadProgress}%` }}
+                        className="h-full bg-amber-400 rounded transition-all duration-300"
+                      ></div>
+                    </div>
+                    <span className="block mt-2 text-xs text-gray-500">
+                      Processing document...
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Document Name & Description */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+              <div>
+                <label htmlFor="document-name" className="block font-semibold mb-3 text-gray-800 text-base">
+                  Document Name
+                </label>
+                <input
+                  id="document-name"
+                  type="text"
+                  value={documentName}
+                  onChange={(e) => setDocumentName(e.target.value)}
+                  placeholder="Enter document name"
+                  required
+                  className="w-full px-4 py-3 border border-gray-300 rounded focus:outline-none focus:border-amber-400 focus:shadow-outline transition"
+                />
+              </div>
+              <div>
+                <label htmlFor="document-description" className="block font-semibold mb-3 text-gray-800 text-base">
+                  Description (Optional)
+                </label>
+                <input
+                  id="document-description"
+                  type="text"
+                  value={documentDescription}
+                  onChange={(e) => setDocumentDescription(e.target.value)}
+                  placeholder="Brief description of the document"
+                  className="w-full px-4 py-3 border border-gray-300 rounded focus:outline-none focus:border-amber-400 focus:shadow-outline transition"
+                />
+              </div>
+            </div>
+
+            {/* Document Hash Display */}
+            {documentHash && (
+              <div className="mb-8 p-4 bg-gray-100 rounded">
+                <label className="block font-semibold mb-2 text-gray-800 text-sm">
+                  Document Hash (SHA-256)
+                </label>
+                <div className="font-mono text-sm text-gray-600 p-2 break-words">
+                  {documentHash}
+                </div>
+              </div>
+            )}
+
+            {/* Error Message */}
+            {error && (
+              <div className="mb-8 p-4 bg-red-50 border-l-4 border-red-500 text-red-600 rounded">
+                {error}
+              </div>
+            )}
+
+            {/* Success Message */}
+            {isSuccess && (
+              <div className="mb-8 p-4 bg-green-50 border-l-4 border-green-500 text-green-600 rounded">
+                Document successfully registered on the blockchain!
+              </div>
+            )}
+
+            {/* Form Buttons */}
+            <div className="flex justify-end gap-4">
+              <button
+                type="button"
+                onClick={() => {
+                  setFile(null);
+                  setDocumentName('');
+                  setDocumentDescription('');
+                  setDocumentHash('');
+                  setError('');
+                  setIsSuccess(false);
+                }}
+                className="bg-gray-100 text-gray-800 rounded px-6 py-3 font-medium transition duration-200 hover:bg-gray-200"
+              >
+                Reset
+              </button>
+              <button
+                type="submit"
+                disabled={isSubmitting || !documentHash || !documentName}
+                className={`flex items-center justify-center min-w-[160px] rounded px-6 py-3 font-medium transition duration-200 ${
+                  isSubmitting || !documentHash || !documentName
+                    ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                    : "bg-amber-400 text-gray-800 hover:bg-amber-500 hover:shadow-md"
+                }`}
+              >
+                {isSubmitting && (
+                  <div className="inline-block w-5 h-5 border-2 border-t-transparent border-white rounded-full animate-spin mr-2"></div>
+                )}
+                {isSubmitting ? "Processing..." : "Register Document"}
+              </button>
+            </div>
+          </form>
+        </div>
+
+        {/* How Document Timestamping Works */}
+        <div className="mt-8 bg-white rounded-lg shadow p-6">
+          <h3 className="flex items-center text-xl font-semibold text-gray-800 mb-4">
+            <span className="inline-block w-3 h-3 bg-green-500 rounded-full mr-2"></span>
+            How Document Timestamping Works
+          </h3>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="p-5 rounded bg-gray-50 border-l-4 border-amber-400">
+              <h4 className="mb-3 text-base font-semibold text-gray-800">1. Upload Document</h4>
+              <p className="text-sm text-gray-600 leading-relaxed">
+                We calculate a unique fingerprint (hash) of your document without storing the actual file.
+              </p>
+            </div>
+            <div className="p-5 rounded bg-gray-50 border-l-4 border-purple-700">
+              <h4 className="mb-3 text-base font-semibold text-gray-800">2. Register on Blockchain</h4>
+              <p className="text-sm text-gray-600 leading-relaxed">
+                The document hash is permanently recorded on the blockchain with a timestamp.
+              </p>
+            </div>
+            <div className="p-5 rounded bg-gray-50 border-l-4 border-green-500">
+              <h4 className="mb-3 text-base font-semibold text-gray-800">3. Verify Anytime</h4>
+              <p className="text-sm text-gray-600 leading-relaxed">
+                You can prove document existence and integrity at any future date using our verification tool.
+              </p>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+
+========== ./components/HowItWorks.js ==========
+'use client';
+import React from 'react';
+
+export default function HowItWorks() {
+  return (
+    <section className="py-16 px-8 md:py-12 md:px-6 bg-gradient-to-br from-white to-gray-100 font-sans">
+      <div className="max-w-6xl mx-auto">
+        {/* Header */}
+        <header className="text-center mb-12">
+          <h1 className="relative inline-block text-4xl md:text-5xl font-bold text-gray-800 mb-4">
+            How It Works
+            <div className="absolute bottom-[-8px] left-1/2 transform -translate-x-1/2 w-20 h-1 bg-amber-400 rounded"></div>
+          </h1>
+          <p className="text-lg text-gray-600 max-w-lg mx-auto leading-relaxed">
+            Our document timestamping service provides a secure, blockchain-based method to prove the existence of your documents at a specific point in time.
+          </p>
+        </header>
+
+        {/* Steps */}
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(300px,1fr))] gap-10 mt-12 md:gap-8">
+          {/* Step 1 */}
+          <div className="relative bg-white rounded-xl p-8 shadow-lg overflow-hidden transition-transform duration-300 hover:-translate-y-1 hover:shadow-xl">
+            {/* Left accent bar */}
+            <div className="absolute top-0 left-0 h-full w-1 bg-amber-400"></div>
+            <div className="relative flex items-center mb-6">
+              <div className="flex items-center justify-center w-12 h-12 rounded-full bg-amber-400 shadow-md mr-4 flex-shrink-0">
+                <span className="text-white font-bold text-xl">1</span>
+              </div>
+              <h3 className="text-xl font-semibold text-gray-800 m-0">
+                Upload Your Document
+              </h3>
+            </div>
+            <p className="text-gray-500 leading-relaxed mb-6">
+              Select and upload the document you want to timestamp. We accept various file formats including PDF, DOC, JPG, and more.
+            </p>
+            <div className="bg-gray-50 rounded-md p-4 border-l-4 border-green-400">
+              <p className="text-sm text-gray-500 m-0">
+                Your document remains private. We only calculate and store a unique fingerprint (hash) of your file.
+              </p>
+            </div>
+          </div>
+
+          {/* Step 2 */}
+          <div className="relative bg-white rounded-xl p-8 shadow-lg overflow-hidden transition-transform duration-300 hover:-translate-y-1 hover:shadow-xl">
+            <div className="absolute top-0 left-0 h-full w-1 bg-green-400"></div>
+            <div className="relative flex items-center mb-6">
+              <div className="flex items-center justify-center w-12 h-12 rounded-full bg-green-400 shadow-md mr-4 flex-shrink-0">
+                <span className="text-white font-bold text-xl">2</span>
+              </div>
+              <h3 className="text-xl font-semibold text-gray-800 m-0">
+                Generate Document Hash
+              </h3>
+            </div>
+            <p className="text-gray-500 leading-relaxed mb-6">
+              Our system creates a unique cryptographic hash of your document using the SHA-256 algorithm. This hash serves as a digital fingerprint for your document.
+            </p>
+            <div className="bg-gray-50 rounded-md p-4 border-l-4 border-purple-700">
+              <p className="text-sm text-gray-500 font-mono m-0 break-words">
+                Example hash: 7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069
+              </p>
+            </div>
+          </div>
+
+          {/* Step 3 */}
+          <div className="relative bg-white rounded-xl p-8 shadow-lg overflow-hidden transition-transform duration-300 hover:-translate-y-1 hover:shadow-xl">
+            <div className="absolute top-0 left-0 h-full w-1 bg-purple-700"></div>
+            <div className="relative flex items-center mb-6">
+              <div className="flex items-center justify-center w-12 h-12 rounded-full bg-purple-700 shadow-md mr-4 flex-shrink-0">
+                <span className="text-white font-bold text-xl">3</span>
+              </div>
+              <h3 className="text-xl font-semibold text-gray-800 m-0">
+                Record on Blockchain
+              </h3>
+            </div>
+            <p className="text-gray-500 leading-relaxed mb-6">
+              The document hash is permanently recorded on the blockchain with a timestamp. This creates an immutable record proving the document existed at that specific time.
+            </p>
+            <div className="bg-gray-50 rounded-md p-4 border-l-4 border-amber-400">
+              <p className="text-sm text-gray-500 m-0">
+                Once recorded, the timestamp cannot be altered or tampered with, providing irrefutable proof of your document's existence.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Technical Explanation Section */}
+        <div className="mt-20 bg-white rounded-xl p-10 shadow-xl md:p-6">
+          <h2 className="flex items-center text-2xl md:text-3xl font-bold text-gray-800 mb-6">
+            <span className="inline-block w-4 h-4 bg-purple-700 mr-3 rounded"></span>
+            Technical Process Explained
+          </h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
+            <div>
+              <h3 className="text-xl font-semibold text-gray-700 mb-4">
+                Cryptographic Hashing
+              </h3>
+              <p className="text-gray-600 leading-relaxed mb-6">
+                We use the SHA-256 cryptographic hash function to generate a unique, fixed-length string of characters that represents your document. Even the smallest change to your document will produce a completely different hash, ensuring the integrity of your timestamped document.
+              </p>
+              <h3 className="text-xl font-semibold text-gray-700 mb-4">
+                Blockchain Anchoring
+              </h3>
+              <p className="text-gray-600 leading-relaxed">
+                The document hash is anchored to the blockchain through a transaction that includes the hash and a timestamp. This creates a permanent, immutable record that can be independently verified by anyone, without requiring access to the original document.
+              </p>
+            </div>
+            <div className="relative bg-gray-50 rounded-md p-6 overflow-hidden">
+              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-amber-400 via-green-400 to-purple-700"></div>
+              <h3 className="text-xl font-semibold text-gray-700 mb-4">
+                Verification Process
+              </h3>
+              <ol className="text-gray-600 pl-6 space-y-4">
+                <li>Upload the document you want to verify</li>
+                <li>Our system calculates the document's hash</li>
+                <li>The system searches the blockchain for matching hash records</li>
+                <li>If found, we display the timestamp and blockchain transaction details</li>
+                <li>You can independently verify this information on any blockchain explorer</li>
+              </ol>
+            </div>
+          </div>
+        </div>
+
+        {/* Interactive Call-to-Action */}
+        <div className="mt-16 text-center">
+          <h2 className="text-2xl md:text-3xl font-bold text-gray-800 mb-6">
+            Ready to Timestamp Your Document?
+          </h2>
+          <p className="text-gray-600 max-w-xl mx-auto mb-8 leading-relaxed">
+            Start securing your important documents with our blockchain timestamping service today.
+          </p>
+          {/* <button
+            className="relative overflow-hidden bg-amber-400 text-gray-800 font-semibold text-lg py-3 px-8 rounded-lg shadow transition-all duration-200 hover:bg-amber-500 hover:-translate-y-1 hover:shadow-lg active:translate-y-0 active:shadow-sm"
+          >
+            Get Started Now
+            <div className="absolute top-0 left-[-100%] w-full h-full bg-gradient-to-r from-transparent via-white/20 to-transparent transition-all duration-700 hover:left-full"></div>
+          </button> */}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+
+========== ./components/Footer.js ==========
+'use client';
+import React from 'react';
+import { useSelector, useDispatch } from 'react-redux';
+import {
+  setSignerConnection,
+  setSignerInstance,
+  setSignerChainId,
+  connectSignerAction,
+  disconnectSignerAction,
+  updateSignerChainIdAction
+} from '../redux/actions';
+import { ethers } from 'ethers';
+
+export default function Footer() {
+  return (
+    <footer className="bg-white border-t border-gray-300 py-12 px-8 text-gray-800 font-sans md:py-8 md:px-4">
+      {/* Main Footer Grid */}
+      <div className="max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+        {/* About Section */}
+        <div className="flex flex-col">
+          <h3 className="text-purple-700 text-xl font-semibold mb-5 relative after:absolute after:bottom-[-0.5rem] after:left-0 after:w-10 after:h-[3px] after:bg-amber-400">
+            About TimestampDocs
+          </h3>
+          <p className="text-sm leading-6 text-gray-500 mb-6">
+            Secure document timestamping service providing blockchain-backed proof of existence for your important files.
+          </p>
+          <div className="flex gap-4">
+            <a
+              href="#"
+              aria-label="Twitter"
+              className="flex items-center justify-center w-10 h-10 rounded-full bg-gray-100 text-purple-700 transition-all duration-300 hover:bg-purple-700 hover:text-white hover:-translate-y-1 hover:shadow-lg"
+            >
+              X
+            </a>
+            <a
+              href="#"
+              aria-label="LinkedIn"
+              className="flex items-center justify-center w-10 h-10 rounded-full bg-gray-100 text-purple-700 transition-all duration-300 hover:bg-purple-700 hover:text-white hover:-translate-y-1 hover:shadow-lg"
+            >
+              in
+            </a>
+            <a
+              href="#"
+              aria-label="GitHub"
+              className="flex items-center justify-center w-10 h-10 rounded-full bg-gray-100 text-purple-700 transition-all duration-300 hover:bg-purple-700 hover:text-white hover:-translate-y-1 hover:shadow-lg"
+            >
+              G
+            </a>
+          </div>
+        </div>
+
+        {/* Quick Links Section */}
+        <div className="flex flex-col">
+          <h3 className="text-purple-700 text-xl font-semibold mb-5 relative after:absolute after:bottom-[-0.5rem] after:left-0 after:w-10 after:h-[3px] after:bg-amber-400">
+            Quick Links
+          </h3>
+          <ul className="list-none p-0 m-0">
+            {["How It Works", "Pricing", "FAQ", "Support"].map((link, index) => (
+              <li key={index} className="mb-3">
+                <a
+                  href="#"
+                  className="text-gray-500 text-sm inline-flex items-center transition-colors duration-200 hover:text-purple-700 transform hover:translate-x-1"
+                >
+                  <span className="mr-2 text-amber-400 transition-transform duration-200">→</span>
+                  {link}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        {/* Legal Section */}
+        <div className="flex flex-col">
+          <h3 className="text-purple-700 text-xl font-semibold mb-5 relative after:absolute after:bottom-[-0.5rem] after:left-0 after:w-10 after:h-[3px] after:bg-amber-400">
+            Legal
+          </h3>
+          <ul className="list-none p-0 m-0">
+            {["Privacy Policy", "Terms of Service", "Cookie Policy", "GDPR Compliance"].map((link, index) => (
+              <li key={index} className="mb-3">
+                <a
+                  href="#"
+                  className="text-gray-500 text-sm inline-flex items-center transition-colors duration-200 hover:text-purple-700 transform hover:translate-x-1"
+                >
+                  <span className="mr-2 text-amber-400 transition-transform duration-200">→</span>
+                  {link}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        {/* Contact Section */}
+        <div className="flex flex-col">
+          <h3 className="text-purple-700 text-xl font-semibold mb-5 relative after:absolute after:bottom-[-0.5rem] after:left-0 after:w-10 after:h-[3px] after:bg-amber-400">
+            Contact Us
+          </h3>
+          <div className="flex items-center mb-3">
+            <div className="min-w-[2rem] h-8 rounded-full bg-gray-100 flex items-center justify-center text-purple-700 mr-4">
+              ✉
+            </div>
+            <a
+              href="mailto:info@timestampdocs.com"
+              className="text-gray-500 text-sm transition-colors duration-200 hover:text-purple-700"
+            >
+              info@timestampdocs.com
+            </a>
+          </div>
+          <div className="flex items-center mb-3">
+            <div className="min-w-[2rem] h-8 rounded-full bg-gray-100 flex items-center justify-center text-purple-700 mr-4">
+              ☎
+            </div>
+            <a
+              href="tel:+11234567890"
+              className="text-gray-500 text-sm transition-colors duration-200 hover:text-purple-700"
+            >
+              +1 (123) 456-7890
+            </a>
+          </div>
+          <div className="mt-6">
+            <h4 className="text-base font-semibold text-gray-600 mb-4">
+              Subscribe to Our Newsletter
+            </h4>
+            <div className="flex flex-col sm:flex-row">
+              <input
+                type="email"
+                placeholder="Your email address"
+                className="flex-1 px-4 py-3 border border-gray-300 rounded-l sm:rounded-l sm:rounded-none focus:outline-none focus:border-purple-700 focus:shadow-outline mb-3 sm:mb-0"
+              />
+              <button className="bg-amber-400 text-gray-800 font-semibold px-4 py-3 rounded-r sm:rounded-r sm:rounded-none transition duration-200 hover:bg-amber-500 w-full sm:w-auto">
+                Subscribe
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Bottom Footer */}
+      <div className="max-w-6xl mx-auto mt-12 pt-8 border-t border-gray-300 flex flex-col md:flex-row justify-between items-center gap-4 text-center">
+        <p className="text-gray-500 text-sm">
+          © 2023 TimestampDocs. All rights reserved.
+        </p>
+        <div className="flex gap-6">
+          {["Sitemap", "Accessibility", "Security"].map((link, index) => (
+            <a
+              key={index}
+              href="#"
+              className="text-gray-500 text-sm transition-colors duration-200 hover:text-purple-700"
+            >
+              {link}
+            </a>
+          ))}
+        </div>
+      </div>
+    </footer>
+  );
+}
+
+
+========== ./components/HeroSection.js ==========
+'use client';
+import React from 'react';
+
+export default function HeroSection() {
+  return (
+    <section
+      className="relative overflow-hidden bg-gradient-to-br from-gray-50 to-gray-100 flex flex-col items-center px-6 py-12 md:px-8 md:py-16 md:min-h-[80vh]"
+    >
+      {/* Background Gradients */}
+      <div
+        className="absolute inset-0 z-0"
+        style={{
+          background:
+            "radial-gradient(circle at top right, rgba(103,58,183,0.05), transparent 60%), radial-gradient(circle at bottom left, rgba(255,193,7,0.05), transparent 60%)",
+        }}
+      />
+
+      {/* Content Container */}
+      <div className="relative z-10 max-w-6xl w-full flex flex-col items-center text-center">
+        {/* Main Heading */}
+        <h1 className="text-2xl sm:text-3xl md:text-5xl font-extrabold text-gray-800 mb-6 leading-tight">
+          Secure Document Timestamps with{' '}
+          <span className="relative text-purple-700 
+            after:content-[''] after:absolute after:bottom-[0.1em] after:left-0 after:w-full after:h-[0.2em] after:bg-amber-400 after:-z-10 after:opacity-30"
+          >
+            Blockchain
+          </span>
+        </h1>
+
+        {/* Subheading */}
+        <h2 className="text-xl md:text-2xl text-gray-600 mb-8 md:mb-10 max-w-lg leading-relaxed">
+          Permanently prove when your documents existed with tamper-proof timestamps. 
+          Protect your intellectual property with military-grade cryptography.
+        </h2>
+
+        {/* Call-to-Action Buttons */}
+        <div className="flex flex-col sm:flex-row gap-4 sm:gap-6 mb-16 w-full justify-center">
+          <button
+            onClick={() => (window.location.href = '/register')}
+            className="bg-amber-400 text-gray-800 font-semibold text-lg py-4 px-10 rounded-lg shadow transition duration-300 hover:bg-amber-500 hover:-translate-y-1 hover:shadow-lg active:translate-y-0 active:shadow-sm w-full sm:w-auto"
+          >
+            Get Started Free
+          </button>
+          <button
+            onClick={() => (window.location.href = '/learn-more')}
+            className="bg-transparent text-purple-700 font-semibold text-lg py-4 px-10 rounded-lg border-2 border-purple-700 transition duration-300 hover:bg-purple-50 w-full sm:w-auto"
+          >
+            Learn More
+          </button>
+        </div>
+
+        {/* Trusted Logos Section */}
+        <div className="flex flex-col items-center mt-8">
+          <p className="text-base text-gray-500 mb-6 font-medium">
+            TRUSTED BY THOUSANDS OF ORGANIZATIONS
+          </p>
+          <div className="flex flex-wrap justify-center gap-6 md:gap-8 lg:gap-10 max-w-3xl">
+            {[1, 2, 3, 4, 5].map((i) => (
+              <div
+                key={i}
+                className="h-10 w-[120px] bg-gray-300 rounded transition duration-300 opacity-70 grayscale hover:opacity-90 hover:grayscale-0"
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Feature Cards */}
+      <div className="mt-14 flex flex-wrap justify-center gap-8 md:gap-6 max-w-4xl z-10">
+        {[
+          { icon: '🔒', title: 'Secure', description: 'Military-grade encryption' },
+          { icon: '⚡', title: 'Fast', description: 'Timestamps in seconds' },
+          { icon: '📄', title: 'Verifiable', description: 'Court-admissible proof' },
+          { icon: '🔗', title: 'Blockchain', description: 'Immutable records' },
+        ].map((item, index) => (
+          <div
+            key={index}
+            className="bg-white p-6 rounded-xl shadow transition-transform duration-300 hover:-translate-y-1 hover:shadow-lg w-full sm:w-1/2 lg:w-[200px]"
+          >
+            <div className="text-4xl mb-4">{item.icon}</div>
+            <h3 className="text-lg font-semibold text-gray-800 mb-2">
+              {item.title}
+            </h3>
+            <p className="text-sm text-gray-500 text-center">
+              {item.description}
+            </p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+
